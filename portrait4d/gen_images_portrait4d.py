@@ -14,9 +14,10 @@ from tqdm import tqdm
 import cv2
 import imageio
 import json
+import math
 
 import legacy
-from camera_utils import LookAtPoseSampler, FOV_to_intrinsics
+from camera_utils import LookAtPoseSampler, FOV_to_intrinsics, UniformCameraPoseSampler
 from torch_utils import misc
 from training.reconstructor.triplane_reconstruct import TriPlaneReconstructorNeutralize
 from training.utils.preprocess import estimate_norm_torch_pdfgc
@@ -232,8 +233,42 @@ def generate_images(
                 exp_params_mot = params_mot[:,325:425]
                 pose_params_mot = params_mot[:,425:431]
                 eye_pose_mot = params_mot[:,431:437]            
-            
+                
+                sample_size = 16
                 c = params_mot[:,:25]
+                c = c.repeat(sample_size, 1)
+                # view sampling
+                
+                cam2world = c[0, :16].reshape(4, 4)
+
+                # 2. 카메라의 위치(Translation) 추출 (마지막 열의 x, y, z)
+                camera_origin = cam2world[:3, 3]
+
+                # 3. 원점으로부터의 거리(Radius) 계산
+                radius = torch.norm(camera_origin).cpu()
+
+
+                vertical_mean = math.pi/2 # 수평 높이 (90도: 정면에서 바라봄)
+
+                # 가로 방향(Yaw) 각도를 0도부터 360도(2*pi)까지 등간격으로 생성
+                # 물체를 한 바퀴 도는 효과
+                horizontal_angles = torch.linspace(math.pi / 3, 2 * math.pi / 3, sample_size)
+                cam2worlds = []
+                for h in horizontal_angles:
+                    # 샘플러의 sample 메서드를 쓰되, stddev를 0으로 주고 mean을 직접 제어
+                    pose = UniformCameraPoseSampler.sample(
+                        horizontal_mean=h, 
+                        vertical_mean=vertical_mean, 
+                        horizontal_stddev=0, 
+                        vertical_stddev=0, 
+                        radius=radius, 
+                        batch_size=1
+                    )
+                    cam2worlds.append(pose)
+                cam2worlds_tensor = torch.cat(cam2worlds, dim=0)
+
+                c[:, :16] = cam2worlds_tensor.to(device).reshape(sample_size, -1)
+                
                 intrinsics = c[:,16:]
                         
                 if use_neck:
@@ -243,20 +278,22 @@ def generate_images(
                     c = torch.cat([extrinsics.reshape(1,-1), intrinsics.reshape(1,-1)], dim=-1)
                 else:
                     pose_params_mot[:,:3] *= 0
-                
-                _deformer = G._deformer(shape_params_app,exp_params_mot,pose_params_mot,eye_pose_mot,use_rotation_limits=False, smooth_th=3e-3)
-                out = G.synthesis(img_app, img_mot, motion_app, motion_mot, c, _deformer=_deformer, neural_rendering_resolution=128, motion_scale=1)
-                
-                
-                img = out['image_sr']
 
-                img_ = (img.permute(0, 2, 3, 1) * 127.5 + 128).clamp(0, 255).to(torch.uint8)
-                img_mot_ = (img_mot.permute(0, 2, 3, 1) * 127.5 + 128).clamp(0, 255).to(torch.uint8)
-                img_app_ = (img_app.permute(0, 2, 3, 1) * 127.5 + 128).clamp(0, 255).to(torch.uint8)
+                for i, camera in enumerate(c):
+                    camera = camera.unsqueeze(0)
+                    _deformer = G._deformer(shape_params_app,exp_params_mot,pose_params_mot,eye_pose_mot,use_rotation_limits=False, smooth_th=3e-3)
+                    out = G.synthesis(img_app, img_mot, motion_app, motion_mot, camera, _deformer=_deformer, neural_rendering_resolution=128, motion_scale=1)
+                    
+                    
+                    img = out['image_sr']
 
-                img = torch.cat([img_app_,img_,img_mot_],dim=2)
+                    img_ = (img.permute(0, 2, 3, 1) * 127.5 + 128).clamp(0, 255).to(torch.uint8)
+                    img_mot_ = (img_mot.permute(0, 2, 3, 1) * 127.5 + 128).clamp(0, 255).to(torch.uint8)
+                    img_app_ = (img_app.permute(0, 2, 3, 1) * 127.5 + 128).clamp(0, 255).to(torch.uint8)
 
-                PIL.Image.fromarray(img[0].cpu().numpy(), 'RGB').save(f'{outdir_sub}/{tar_idx:05d}.jpg', quality=95)
+                    img = torch.cat([img_app_,img_,img_mot_],dim=2)
+
+                    PIL.Image.fromarray(img[0].cpu().numpy(), 'RGB').save(f'{outdir_sub}/{tar_idx:05d}_{i}.jpg', quality=95)
                 
                 if shape:
                     os.makedirs(f'{outdir_sub}/shapes', exist_ok=True)
